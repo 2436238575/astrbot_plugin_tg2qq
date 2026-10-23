@@ -1,0 +1,5 @@
+name: astrbot_plugin_tg2qq
+display_name: TgQQ
+desc: 轮询 Telegram 公开频道预览页(t.me/s/xxx),把更新合并为合并转发消息推送到 QQ 群
+version: 0.1.0
+author: 熵

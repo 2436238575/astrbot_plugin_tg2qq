@@ -1,0 +1,27 @@
+{
+  "tg_channels": {
+    "description": "TG 频道列表",
+    "type": "list",
+    "hint": "要监听的 Telegram 公开频道,支持 @xxx、t.me/xxx 或完整链接。留空则不监听也不推送。",
+    "obvious_hint": true,
+    "default": []
+  },
+  "poll_interval_minutes": {
+    "description": "轮询间隔(分钟)",
+    "type": "int",
+    "hint": "每隔多少分钟抓取一次频道更新,最小 1 分钟",
+    "default": 30
+  },
+  "whitelist_groups": {
+    "description": "QQ 群白名单",
+    "type": "list",
+    "hint": "允许推送的 QQ 群号列表。留空则推送到机器人所在的所有群。",
+    "default": []
+  },
+  "send_interval_seconds": {
+    "description": "发送间隔(秒)",
+    "type": "float",
+    "hint": "向多个群依次推送时,每次发送之间的间隔秒数,避免触发账号风控",
+    "default": 0.5
+  }
+}
