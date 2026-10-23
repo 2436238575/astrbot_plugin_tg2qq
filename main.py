@@ -11,7 +11,9 @@ import asyncio
 import html
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -35,6 +37,11 @@ UA = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 STYLE_URL_RE = re.compile(r"background-image\s*:\s*url\(['\"]?(.*?)['\"]?\)")
+
+try:
+    TZ = ZoneInfo("Asia/Shanghai")
+except Exception:  # systems without a tz database
+    TZ = timezone.utc
 
 
 def _html_to_text(node: Tag) -> str:
@@ -517,7 +524,13 @@ class Tg2qqPlugin(Star):
         post_url = f"https://t.me/{channel}/{msg['id']}"
         parts: list[str] = []
         if msg.get("date"):
-            parts.append(f"{msg['date'][:16].replace('T', ' ')} UTC")
+            try:
+                dt = datetime.fromisoformat(msg["date"])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                parts.append(f"{dt.astimezone(TZ):%Y-%m-%d %H:%M}")
+            except ValueError:
+                parts.append(msg["date"][:16].replace("T", " "))
         if msg.get("reply"):
             parts.append(self._filter_text(f"↩ {msg['reply']}", exempt))
         if msg.get("text"):
