@@ -101,7 +101,19 @@ def parse_page(page_html: str) -> tuple[list[dict], str | None]:
         except ValueError:
             continue
 
-        text_node = wrap.select_one(".tgme_widget_message_text")
+        # A reply bubble embeds its own .tgme_widget_message_text holding the
+        # quoted text, which comes first in document order; the real message
+        # body is the first text node OUTSIDE the reply element.
+        reply_node = wrap.select_one(".tgme_widget_message_reply")
+        reply_text_node = (
+            reply_node.select_one(".tgme_widget_message_text") if reply_node else None
+        )
+        text_node = None
+        for node in wrap.select(".tgme_widget_message_text"):
+            if reply_node is not None and reply_node in node.parents:
+                continue
+            text_node = node
+            break
         text = _html_to_text(text_node) if text_node else ""
         # Posts that require opening in Telegram render as a placeholder notice;
         # treat them as contentless so the fallback (post link) kicks in.
@@ -138,13 +150,14 @@ def parse_page(page_html: str) -> tuple[list[dict], str | None]:
         has_video = bool(wrap.select_one("video, .tgme_widget_message_video_thumb"))
 
         reply = None
-        reply_node = wrap.select_one(".tgme_widget_message_reply")
         if reply_node:
             author_node = reply_node.select_one(".tgme_widget_message_author")
-            reply_text_node = reply_node.select_one(".tgme_widget_message_text")
             author = author_node.get_text(" ", strip=True) if author_node else ""
             reply_text = _html_to_text(reply_text_node) if reply_text_node else ""
-            reply = " ".join(p for p in (author, reply_text) if p) or None
+            if author and reply_text:
+                reply = f"{author}: {reply_text}"
+            else:
+                reply = (author or reply_text) or None
 
         date_node = wrap.select_one(".tgme_widget_message_date time")
         messages.append(
