@@ -20,6 +20,9 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.pipeline.content_safety_check.strategies.strategy import (
+    StrategySelector,
+)
 
 PLUGIN_NAME = "astrbot_plugin_tg2qq"
 BASE_URL = "https://t.me/s/{channel}"
@@ -189,6 +192,10 @@ class Tg2qqPlugin(Star):
         self.whitelist: list[str] = []
         self.poll_interval = 30
         self.send_interval = 0.5
+        self.skip_res: list[re.Pattern] = []
+        self.filter_res: list[re.Pattern] = []
+        self.exclude_res: list[re.Pattern] = []
+        self.safety: StrategySelector | None = None
 
     async def initialize(self):
         """Read config, load the baseline and start the background polling task."""
@@ -196,6 +203,26 @@ class Tg2qqPlugin(Star):
         self.send_interval = max(
             float(self.config.get("send_interval_seconds") or 0.5), 0.0
         )
+        self.skip_res = self._compile_regexes("skip_push_regex")
+        self.filter_res = self._compile_regexes("filter_regex")
+        self.exclude_res = self._compile_regexes("exclude_regex")
+        if self.config.get("use_content_safety"):
+            try:
+                safety_cfg = self.context.get_config().get("content_safety") or {}
+                selector = StrategySelector(safety_cfg)
+                if selector.enabled_strategies:
+                    self.safety = selector
+                    names = [type(s).__name__ for s in self.safety.enabled_strategies]
+                    logger.info(f"[tg2qq] content safety strategies active: {names}")
+                else:
+                    logger.info(
+                        "[tg2qq] content safety enabled but no strategy configured "
+                        "in the main config, check stays off"
+                    )
+            except Exception:
+                logger.exception(
+                    "[tg2qq] failed to init content safety, check stays off"
+                )
         self.whitelist = [
             str(g).strip()
             for g in (self.config.get("whitelist_groups") or [])
@@ -233,6 +260,40 @@ class Tg2qqPlugin(Star):
         if self.client:
             await self.client.aclose()
             self.client = None
+
+    def _compile_regexes(self, key: str) -> list[re.Pattern]:
+        """Compile a regex config entry into a list of patterns.
+
+        The config value is normally a list where each item is one regex; a
+        plain string (legacy single-regex config) is accepted as a one-item
+        list. A message matches when ANY pattern matches.
+
+        Args:
+            key: Config key holding the pattern(s) (e.g. "skip_push_regex").
+
+        Returns:
+            Compiled case-insensitive patterns; invalid items are logged and
+            dropped, an empty/missing value yields an empty list (disabled).
+        """
+        raw = self.config.get(key)
+        if isinstance(raw, str):
+            items = [raw]
+        elif isinstance(raw, list):
+            items = [str(item) for item in raw]
+        else:
+            items = []
+        compiled: list[re.Pattern] = []
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                compiled.append(re.compile(item, re.IGNORECASE))
+            except re.error:
+                logger.warning(
+                    f"[tg2qq] invalid regex in '{key}', item disabled: {item!r}"
+                )
+        return compiled
 
     def _load_baseline(self) -> dict[str, int]:
         """Load the per-channel baseline (last seen message id) from disk.
@@ -400,13 +461,40 @@ class Tg2qqPlugin(Star):
                 groups.append(gid)
         return groups
 
-    def _build_node(self, channel: str, title: str | None, msg: dict) -> Node:
+    def _filter_text(self, text: str, exempt: bool) -> str:
+        """Apply the content filter regex to one pushed text block.
+
+        Args:
+            text: A text block (body, reply, link or video placeholder).
+            exempt: True when the message matched exclude_regex and must not
+                be filtered.
+
+        Returns:
+            The text with filter matches removed; when a removal happens,
+            lines emptied by it are dropped.
+        """
+        if exempt or not self.filter_res:
+            return text
+        filtered = text
+        for pattern in self.filter_res:
+            filtered = pattern.sub("", filtered)
+        if filtered == text:
+            return text
+        filtered = re.sub(r"[ \t]{2,}", " ", filtered)
+        lines = [line.strip() for line in filtered.split("\n")]
+        return "\n".join(line for line in lines if line)
+
+    def _build_node(
+        self, channel: str, title: str | None, msg: dict, exempt: bool
+    ) -> Node:
         """Build one forward node from a parsed Telegram message.
 
         Args:
             channel: The real channel username (used for the post link).
             title: The channel display title, used as the node sender name.
             msg: A message dict produced by parse_page.
+            exempt: True when the message matched exclude_regex; the content
+                filter is skipped for it.
 
         Returns:
             A Node whose content is the post time, text, links, video
@@ -418,12 +506,19 @@ class Tg2qqPlugin(Star):
         if msg.get("date"):
             parts.append(f"{msg['date'][:16].replace('T', ' ')} UTC")
         if msg.get("reply"):
-            parts.append(f"↩ {msg['reply']}")
+            parts.append(self._filter_text(f"↩ {msg['reply']}", exempt))
         if msg.get("text"):
-            parts.append(msg["text"])
-        parts.extend(msg.get("links", []))
+            parts.append(self._filter_text(msg["text"], exempt))
+        for link in msg.get("links", []):
+            link = self._filter_text(link, exempt)
+            if link:
+                parts.append(link)
         if msg.get("video"):
-            parts.append(f"▶ 视频见原文: {post_url}")
+            placeholder = self._filter_text(f"▶ 视频见原文: {post_url}", exempt)
+            # When the filter stripped the URL the line ends with a bare colon.
+            placeholder = placeholder.rstrip(":").rstrip()
+            if placeholder:
+                parts.append(placeholder)
         content: list = []
         if parts:
             content.append(Plain("\n".join(parts)))
@@ -450,8 +545,54 @@ class Tg2qqPlugin(Star):
             logger.warning("[tg2qq] no target group resolved, skip push")
             return
         platform_id = platform.meta().id
+        entries: list[tuple[dict, bool]] = []
+        skipped = 0
+        blocked = 0
+        for m in messages:
+            text = m.get("text") or ""
+            exempt = any(p.search(text) for p in self.exclude_res)
+            if not exempt and any(p.search(text) for p in self.skip_res):
+                skipped += 1
+                continue
+            if self.safety is not None and text:
+                # The strategies use blocking HTTP (Baidu SDK), so run them in a
+                # worker thread; fail open on errors since the baseline moves on
+                # regardless and a moderation outage should not mute the channel.
+                try:
+                    ok, info = await asyncio.to_thread(self.safety.check, text)
+                except Exception:
+                    logger.exception(
+                        "[tg2qq] content safety check errored, message allowed"
+                    )
+                else:
+                    if not ok:
+                        blocked += 1
+                        logger.info(
+                            f"[tg2qq] @{channel}: message {m['id']} blocked by "
+                            f"content safety: {info}"
+                        )
+                        continue
+            entries.append((m, exempt))
+        if blocked:
+            logger.info(
+                f"[tg2qq] @{channel}: {blocked} message(s) blocked by content safety"
+            )
+        if skipped:
+            logger.info(
+                f"[tg2qq] @{channel}: {skipped} message(s) skipped by skip_push_regex"
+            )
+        if not entries:
+            logger.info(f"[tg2qq] @{channel}: nothing left to push after skipping")
+            return
         chain = MessageChain(
-            chain=[Nodes([self._build_node(channel, title, m) for m in messages])]
+            chain=[
+                Nodes(
+                    [
+                        self._build_node(channel, title, m, exempt)
+                        for m, exempt in entries
+                    ]
+                )
+            ]
         )
         for group in groups:
             try:
@@ -467,5 +608,5 @@ class Tg2qqPlugin(Star):
             if self.send_interval > 0:
                 await asyncio.sleep(self.send_interval)
         logger.info(
-            f"[tg2qq] @{channel}: forwarded {len(messages)} message(s) to {len(groups)} group(s)"
+            f"[tg2qq] @{channel}: forwarded {len(entries)} message(s) to {len(groups)} group(s)"
         )
